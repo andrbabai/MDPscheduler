@@ -1,0 +1,20 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "FastAPI",
+            "type": "python",
+            "request": "launch",
+            "module": "uvicorn",
+            "args": ["schedics.server:app", "--reload", "--port", "8080"],
+            "jinja": true
+        },
+        {
+            "name": "Build ICS",
+            "type": "python",
+            "request": "launch",
+            "module": "schedics.cli",
+            "args": ["build", "--config", "config.yml", "--output", "public/schedule.ics"]
+        }
+    ]
+}
