@@ -1,0 +1,10 @@
+openpyxl
+icalendar
+requests
+fastapi
+uvicorn
+python-dateutil
+pydantic
+pyyaml
+pytest
+httpx
