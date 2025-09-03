@@ -6,3 +6,4 @@ uid_prefix: "r7-ucp24-"
 scan:
   max_header_rows: 8
   date_scan_up: 8
+  max_row: null
