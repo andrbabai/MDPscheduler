@@ -133,6 +133,7 @@ async def index(request: Request) -> str:
         cal_rows2.append("<tr>" + "".join(tds) + "</tr>")
     cal_html2 = "".join(cal_rows2)
 
+
     # Month navigation links
     def _shift_month(d: _dt.date, delta: int) -> _dt.date:
         y = d.year + (d.month + delta - 1) // 12
