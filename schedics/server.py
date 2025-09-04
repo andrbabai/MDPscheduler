@@ -64,14 +64,19 @@ async def index(request: Request) -> str:
     except Exception:
         base = _dt.date(today.year, today.month, 1)
     min_month = _dt.date(2025, 1, 1)
-    max_month = _dt.date(2026, 1, 1)
+    max_month = _dt.date(2026, 12, 1)
     if base < min_month:
         base = min_month
     if base > max_month:
         base = max_month
 
     grid = _cal.monthcalendar(base.year, base.month)  # list of weeks, 0 = out of month
-    month_name = base.strftime("%B %Y")
+    # Russian month name
+    _RU_MONTHS = [
+        "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+        "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+    ]
+    month_name = f"{_RU_MONTHS[base.month-1]} {base.year}"
     weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
     # Render calendar rows
@@ -105,6 +110,7 @@ async def index(request: Request) -> str:
         lst.sort(key=lambda x: x["time"])
 
     cal_rows2 = []
+    today_dt = _dt.date.today()
     for week in grid:
         tds = []
         for d in week:
@@ -116,8 +122,9 @@ async def index(request: Request) -> str:
                     f"<div class=\"ev-item\"><span class=\"ev-time\">{e['time']}</span><span class=\"ev-title\">{e['summary']}</span></div>"
                     for e in items
                 )
+                cls = "today" if (base.year == today_dt.year and base.month == today_dt.month and d == today_dt.day) else ""
                 tds.append(
-                    f'<td><div class="day"><div class="day-num">{d}</div><div class="ev-list">{ev_html}</div></div></td>'
+                    f'<td class="{cls}"><div class="day"><div class="day-num">{d}</div><div class="ev-list">{ev_html}</div></div></td>'
                 )
         cal_rows2.append("<tr>" + "".join(tds) + "</tr>")
     cal_html2 = "".join(cal_rows2)
@@ -130,9 +137,44 @@ async def index(request: Request) -> str:
     prev_m = _shift_month(base, -1)
     next_m = _shift_month(base, +1)
     prev_allowed = prev_m >= _dt.date(2025, 1, 1)
-    next_allowed = next_m <= _dt.date(2026, 1, 1)
+    next_allowed = next_m <= _dt.date(2026, 12, 1)
     prev_href = f"/?m={prev_m.strftime('%Y-%m')}" if prev_allowed else "#"
     next_href = f"/?m={next_m.strftime('%Y-%m')}" if next_allowed else "#"
+
+    # Stats: total, past, remaining overall
+    now_utc = _dt.datetime.now(_dt.timezone.utc)
+    total_events = len(_events_cache)
+    past_events = 0
+    remaining_overall = 0
+    for ev in _events_cache:
+        ds = ev.get("dtstart")
+        de = ev.get("dtend")
+        if not ds:
+            continue
+        try:
+            dt_s = _dt.datetime.fromisoformat(ds)
+        except Exception:
+            continue
+        dt_e = None
+        if de:
+            try:
+                dt_e = _dt.datetime.fromisoformat(de)
+            except Exception:
+                dt_e = None
+        # Convert to UTC for comparison
+        dt_s_utc = dt_s.astimezone(_dt.timezone.utc) if dt_s.tzinfo else dt_s.replace(tzinfo=_dt.timezone.utc)
+        dt_e_utc = dt_e.astimezone(_dt.timezone.utc) if (dt_e and dt_e.tzinfo) else dt_e
+        if dt_e_utc and dt_e_utc < now_utc:
+            past_events += 1
+        # Remaining overall: events that haven't started yet
+        if dt_s_utc >= now_utc:
+            remaining_overall += 1
+
+    stats_html = (
+        f"<div class=\\\"p-stats\\\"><strong>Всего пар:</strong> {total_events}<br>"
+        f"<strong>Прошло:</strong> {past_events}<br>"
+        f"<strong>Осталось:</strong> {remaining_overall}</div>"
+    )
 
     return (
         "<!doctype html>"
@@ -164,6 +206,7 @@ async def index(request: Request) -> str:
         ".calendar th{background:#fafafa;font-weight:600;color:#666;text-align:center}"
         ".calendar td{background:#fff;text-align:left}"
         ".calendar td.muted{color:#cccccc;background:#fff}"
+        ".calendar td.today{background:#fff4e5} .calendar td.today .day-num{color:#ff4f00}"
         ".calendar td:hover{background:#f3f4f6}"
         ".cal-head{display:flex;justify-content:space-between;align-items:center;margin:8px 0 12px;gap:8px}"
         ".cal-nav{display:flex;gap:8px}"
@@ -191,7 +234,6 @@ async def index(request: Request) -> str:
         "</header>"
 
         "<section class=\"section\">"
-        "<h2>Просмотр календаря</h2>"
         "<div class=\"card\">"
         f"<div class=cal-head><h3 style=\"margin:0\">{month_name.title()}</h3><div class=cal-nav>" +
         (f"<a href=\"{prev_href}\">← Пред</a>" if prev_allowed else "<a class=\\\"disabled\\\" href=\\\"#\\\">← Пред</a>") +
@@ -201,6 +243,7 @@ async def index(request: Request) -> str:
         "<thead><tr>" + "".join(f"<th>{d}</th>" for d in weekdays) + "</tr></thead>"
         f"<tbody>{cal_html2}</tbody>"
         "</table>"
+        f"{stats_html}"
         "</div>"
         "</section>"
 
@@ -209,9 +252,10 @@ async def index(request: Request) -> str:
         "<div class=\"card\">"
         "<a class=\"btn download\" href=\"/schedule.ics\">🗓️ Скачать календарь</a>"
         "</div>"
+        "<div class=\"card callout\">Для установки во встроенные календари Apple просто нажмите \"Скачать календарь\" и откройте файл .ics</div>"
         "<div class=\"card\">"
         "<strong>Инструкция для установки в Google календарь</strong>"
-        "<div class=\"hint\">Вам нужен Шаг 2</div>"
+        "<div class=\"hint\">Вам нужен <strong>Шаг 2</strong></div>"
         "<a class=\"btn secondary\" href=\"https://support.google.com/calendar/answer/37118?hl=ru&co=GENIE.Platform%3DDesktop\" target=\"_blank\" rel=\"noopener\">Открыть инструкцию</a>"
         "</div>"
         "<div class=\"card\">"
