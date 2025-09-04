@@ -158,6 +158,21 @@ def _iter_events(ws, cfg: Config):
         summary = clean[0] if clean else ""
         # For description, exclude numeric-only lines
         desc_lines = [ln for ln in clean[1:] if not _re.fullmatch(r"\d+", ln)]
+        # Move key markers (НАЧАЛО/ЗАЩИТА ОТЧЕТА/ЗАЧЕТ С ОЦЕНКОЙ/ЭКЗАМЕН/ЗАЧЁТ/ЗАЩИТА) into summary together with first detail line
+        KEY_MARKERS = {
+            "начало",
+            "защита отчета",
+            "защита отчёта",
+            "зачет с оценкой",
+            "зачёт с оценкой",
+            "экзамен",
+            "зачет",
+            "зачёт",
+            "защита",
+        }
+        if summary.strip().lower() in KEY_MARKERS and desc_lines:
+            summary = f"{summary} — {desc_lines[0]}"
+            desc_lines = desc_lines[1:]
         desc = "\n".join(desc_lines)
         return summary, desc
 
