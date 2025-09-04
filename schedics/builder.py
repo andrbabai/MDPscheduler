@@ -42,6 +42,19 @@ class Config(BaseModel):
 TIME_RE = re.compile(r"(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})")
 DATE_RE = re.compile(r"(\d{1,2})[.,](\d{1,2})")
 
+# Keywords indicating a special event that should be highlighted
+# (matched case-insensitively within summary/description)
+SPECIAL_KEYWORDS = {
+    "дедлайн",
+    "защита",
+    "зачет",
+    "зачёт",
+    "экзамен",
+    "начало",
+}
+
+HIGHLIGHT_COLOR = "#fadadd"
+
 
 def read_config(path: str | Path) -> Config:
     """Read configuration from YAML file."""
@@ -101,7 +114,7 @@ def _iter_events(ws, cfg: Config):
                 if name in DAYS:
                     day_cols[cell.column] = name
     if not day_cols:
-        return
+        return []
 
     # Respect max_row limit if configured
     max_row = cfg.scan.max_row if getattr(cfg, "scan", None) and cfg.scan.max_row else ws.max_row
@@ -158,7 +171,7 @@ def _iter_events(ws, cfg: Config):
         summary = clean[0] if clean else ""
         # For description, exclude numeric-only lines
         desc_lines = [ln for ln in clean[1:] if not _re.fullmatch(r"\d+", ln)]
-        # Move key markers (НАЧАЛО/ЗАЩИТА ОТЧЕТА/ЗАЧЕТ С ОЦЕНКОЙ/ЭКЗАМЕН/ЗАЧЁТ/ЗАЩИТА) into summary together with first detail line
+        # Move key markers (e.g., НАЧАЛО/ЗАЩИТА/ЗАЧЕТ/ЭКЗАМЕН) into summary together with first detail line
         KEY_MARKERS = {
             "начало",
             "защита отчета",
@@ -169,12 +182,18 @@ def _iter_events(ws, cfg: Config):
             "зачет",
             "зачёт",
             "защита",
+            "дедлайн",
         }
         if summary.strip().lower() in KEY_MARKERS and desc_lines:
             summary = f"{summary} — {desc_lines[0]}"
             desc_lines = desc_lines[1:]
         desc = "\n".join(desc_lines)
         return summary, desc
+
+    def _is_special(summary: str, desc: str | None) -> bool:
+        s = (summary or "").lower()
+        d = (desc or "").lower()
+        return any(k in s or k in d for k in SPECIAL_KEYWORDS)
 
     if time_rows:
         # Classic layout path
@@ -200,6 +219,14 @@ def _iter_events(ws, cfg: Config):
                 event.add("dtstart", dtstart)
                 event.add("dtend", dtend)
                 event.add("uid", uid)
+                # Mark special events for clients that support RFC 7986 COLOR
+                if _is_special(summary, desc):
+                    try:
+                        event.add("color", HIGHLIGHT_COLOR)
+                    except Exception:
+                        # Fallback: add as custom property if library rejects COLOR
+                        event.add("X-COLOR", HIGHLIGHT_COLOR)
+                    event.add("categories", "highlight")
                 yield event
     else:
         # Alternative layout: times and dates are in the day columns headers
@@ -247,6 +274,13 @@ def _iter_events(ws, cfg: Config):
                 event.add("dtstart", dtstart)
                 event.add("dtend", dtend)
                 event.add("uid", uid)
+                # Mark special events
+                if _is_special(summary, desc):
+                    try:
+                        event.add("color", HIGHLIGHT_COLOR)
+                    except Exception:
+                        event.add("X-COLOR", HIGHLIGHT_COLOR)
+                    event.add("categories", "highlight")
                 yield event
 
 
@@ -259,7 +293,7 @@ def build_ics(cfg: Config) -> bytes:
         cal = Calendar()
         cal.add("prodid", "-//schedics//")
         cal.add("version", "2.0")
-        for ev in _iter_events(ws, cfg):
+        for ev in (_iter_events(ws, cfg) or []):
             cal.add_component(ev)
         return cal.to_ical()
 
@@ -274,7 +308,7 @@ def build_ics_and_events(cfg: Config) -> tuple[bytes, list[dict]]:
         cal.add("prodid", "-//schedics//")
         cal.add("version", "2.0")
         events: list[dict] = []
-        for ev in _iter_events(ws, cfg):
+        for ev in (_iter_events(ws, cfg) or []):
             cal.add_component(ev)
             # Extract fields for debugging/verification
             try:
@@ -287,10 +321,12 @@ def build_ics_and_events(cfg: Config) -> tuple[bytes, list[dict]]:
                 dtend = None
             summary = ev.get("summary")
             desc = ev.get("description")
+            color_prop = ev.get("color") or ev.get("X-COLOR")
             events.append({
                 "summary": str(summary) if summary is not None else None,
                 "description": str(desc) if desc is not None else None,
                 "dtstart": dtstart.isoformat() if hasattr(dtstart, "isoformat") else None,
                 "dtend": dtend.isoformat() if hasattr(dtend, "isoformat") else None,
+                "color": str(color_prop) if color_prop is not None else None,
             })
         return cal.to_ical(), events
