@@ -114,7 +114,7 @@ def _iter_events(ws, cfg: Config):
                 if name in DAYS:
                     day_cols[cell.column] = name
     if not day_cols:
-        return
+        return []
 
     # Respect max_row limit if configured
     max_row = cfg.scan.max_row if getattr(cfg, "scan", None) and cfg.scan.max_row else ws.max_row
@@ -160,35 +160,35 @@ def _iter_events(ws, cfg: Config):
         # fallback to original behavior (scan up and error)
         return _find_date(ws, row, col, cfg)
 
-def _split_summary_desc(text: str) -> tuple[str, str]:
-    import re as _re
-    # Convert long sequences of spaces/tabs into newlines
-    text = _re.sub(r"[\t ]{3,}", "\n", text)
-    # Normalize lines, drop numeric-only lines from description
-    parts = [ln.strip() for ln in text.splitlines()]
-    clean = [ln for ln in parts if ln]
-    # First non-empty line as summary
-    summary = clean[0] if clean else ""
-    # For description, exclude numeric-only lines
-    desc_lines = [ln for ln in clean[1:] if not _re.fullmatch(r"\d+", ln)]
-    # Move key markers (e.g., НАЧАЛО/ЗАЩИТА/ЗАЧЕТ/ЭКЗАМЕН) into summary together with first detail line
-    KEY_MARKERS = {
-        "начало",
-        "защита отчета",
-        "защита отчёта",
-        "зачет с оценкой",
-        "зачёт с оценкой",
-        "экзамен",
-        "зачет",
-        "зачёт",
-        "защита",
-        "дедлайн",
-    }
-    if summary.strip().lower() in KEY_MARKERS and desc_lines:
-        summary = f"{summary} — {desc_lines[0]}"
-        desc_lines = desc_lines[1:]
-    desc = "\n".join(desc_lines)
-    return summary, desc
+    def _split_summary_desc(text: str) -> tuple[str, str]:
+        import re as _re
+        # Convert long sequences of spaces/tabs into newlines
+        text = _re.sub(r"[\t ]{3,}", "\n", text)
+        # Normalize lines, drop numeric-only lines from description
+        parts = [ln.strip() for ln in text.splitlines()]
+        clean = [ln for ln in parts if ln]
+        # First non-empty line as summary
+        summary = clean[0] if clean else ""
+        # For description, exclude numeric-only lines
+        desc_lines = [ln for ln in clean[1:] if not _re.fullmatch(r"\d+", ln)]
+        # Move key markers (e.g., НАЧАЛО/ЗАЩИТА/ЗАЧЕТ/ЭКЗАМЕН) into summary together with first detail line
+        KEY_MARKERS = {
+            "начало",
+            "защита отчета",
+            "защита отчёта",
+            "зачет с оценкой",
+            "зачёт с оценкой",
+            "экзамен",
+            "зачет",
+            "зачёт",
+            "защита",
+            "дедлайн",
+        }
+        if summary.strip().lower() in KEY_MARKERS and desc_lines:
+            summary = f"{summary} — {desc_lines[0]}"
+            desc_lines = desc_lines[1:]
+        desc = "\n".join(desc_lines)
+        return summary, desc
 
     def _is_special(summary: str, desc: str | None) -> bool:
         s = (summary or "").lower()
@@ -293,7 +293,7 @@ def build_ics(cfg: Config) -> bytes:
         cal = Calendar()
         cal.add("prodid", "-//schedics//")
         cal.add("version", "2.0")
-        for ev in _iter_events(ws, cfg):
+        for ev in (_iter_events(ws, cfg) or []):
             cal.add_component(ev)
         return cal.to_ical()
 
@@ -308,7 +308,7 @@ def build_ics_and_events(cfg: Config) -> tuple[bytes, list[dict]]:
         cal.add("prodid", "-//schedics//")
         cal.add("version", "2.0")
         events: list[dict] = []
-        for ev in _iter_events(ws, cfg):
+        for ev in (_iter_events(ws, cfg) or []):
             cal.add_component(ev)
             # Extract fields for debugging/verification
             try:
