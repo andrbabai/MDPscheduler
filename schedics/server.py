@@ -105,6 +105,7 @@ async def index(request: Request) -> str:
             by_day.setdefault(dt.day, []).append({
                 "time": dt.strftime("%H:%M"),
                 "summary": ev.get("summary") or "",
+                "color": ev.get("color"),
             })
     for lst in by_day.values():
         lst.sort(key=lambda x: x["time"])
@@ -118,10 +119,13 @@ async def index(request: Request) -> str:
                 tds.append('<td class="muted">&nbsp;</td>')
             else:
                 items = by_day.get(d, [])
-                ev_html = "".join(
-                    f"<div class=\"ev-item\"><span class=\"ev-time\">{e['time']}</span><span class=\"ev-title\">{e['summary']}</span></div>"
-                    for e in items
-                )
+                ev_html_parts = []
+                for e in items:
+                    cls_extra = " special" if (e.get("color") == "#fadadd") else ""
+                    ev_html_parts.append(
+                        f"<div class=\"ev-item{cls_extra}\"><span class=\"ev-time\">{e['time']}</span><span class=\"ev-title\">{e['summary']}</span></div>"
+                    )
+                ev_html = "".join(ev_html_parts)
                 cls = "today" if (base.year == today_dt.year and base.month == today_dt.month and d == today_dt.day) else ""
                 tds.append(
                     f'<td class="{cls}"><div class="day"><div class="day-num">{d}</div><div class="ev-list">{ev_html}</div></div></td>'
@@ -214,6 +218,7 @@ async def index(request: Request) -> str:
         ".cal-nav a.disabled{pointer-events:none;opacity:.5}"
         ".day{min-height:68px} .day-num{font-weight:600;margin-bottom:4px;color:#333;text-align:right}"
         ".ev-item{font-size:12px;color:#333;margin:2px 0;padding:2px 4px;border-radius:6px;background:#fafafa}"
+        ".ev-item.special{background:#fadadd}"
         ".ev-time{color:#666;margin-right:4px}"
         ""
         "label{display:block;margin:8px 0 6px;color:#333}"
