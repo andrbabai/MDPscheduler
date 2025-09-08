@@ -1,7 +1,7 @@
 """Schedule builder: download XLSX and convert to ICS."""
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 import re
 import tempfile
@@ -28,6 +28,14 @@ class ScanConfig(BaseModel):
     max_header_rows: int = 8
     date_scan_up: int = 8
     max_row: int | None = None
+    # New scanning strategy settings (row-wise parsing)
+    header_min_row: int = 1           # first header row (inclusive)
+    header_max_row: int = 5           # last header row (inclusive)
+    time_row: int = 2                 # row with time headers per column
+    first_event_row: int = 6          # first row with event data
+    col_start: int = 2                # B
+    col_end: int = 14                 # N
+    default_duration_minutes: int = 90
 
 
 class Config(BaseModel):
@@ -40,6 +48,7 @@ class Config(BaseModel):
 
 
 TIME_RE = re.compile(r"(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})")
+SINGLE_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 DATE_RE = re.compile(r"(\d{1,2})[.,](\d{1,2})")
 
 # Keywords indicating a special event that should be highlighted
@@ -94,8 +103,18 @@ def _is_top_left(ws, row: int, col: int) -> bool:
 
 
 def _find_date(ws, row: int, col: int, cfg: Config) -> date:
+    """Scan upward to find a date for a cell, supporting merged cells and xlsx date types.
+
+    Looks up within ``cfg.scan.date_scan_up`` rows for:
+    - a datetime/date cell (returns its date), or
+    - a string containing DD.MM or DD,MM pattern.
+    """
     for r in range(row, max(row - cfg.scan.date_scan_up, 0), -1):
         val = _cell_value(ws, r, col)
+        if isinstance(val, datetime):
+            return val.date()
+        if isinstance(val, date):
+            return val
         if isinstance(val, str):
             m = DATE_RE.search(val)
             if m:
@@ -105,35 +124,13 @@ def _find_date(ws, row: int, col: int, cfg: Config) -> date:
 
 
 def _iter_events(ws, cfg: Config):
-    # day columns
-    day_cols: dict[int, str] = {}
-    for row in ws.iter_rows(min_row=1, max_row=cfg.scan.max_header_rows):
-        for cell in row:
-            if isinstance(cell.value, str):
-                name = cell.value.strip().lower()
-                if name in DAYS:
-                    day_cols[cell.column] = name
-    if not day_cols:
-        return []
-
     # Respect max_row limit if configured
     max_row = cfg.scan.max_row if getattr(cfg, "scan", None) and cfg.scan.max_row else ws.max_row
-
-    # time rows (classic layout: times in column A)
-    time_rows: dict[int, tuple[time, time]] = {}
-    for cell in ws["A"]:
-        if isinstance(cell.value, str):
-            m = TIME_RE.search(cell.value)
-            if m:
-                start = time(int(m.group(1)), int(m.group(2)))
-                end = time(int(m.group(3)), int(m.group(4)))
-                if cell.row <= max_row:
-                    time_rows[cell.row] = (start, end)
 
     tzinfo = tz.gettz(cfg.timezone)
 
     # Helper: scan upward in a column to find time range from any header cell
-    def _scan_time_up(row: int, col: int) -> tuple[time, time] | None:
+    def _scan_time_up(row: int, col: int) -> tuple[time, time | None] | None:
         for r2 in range(row, 0, -1):
             v = _cell_value(ws, r2, col)
             if isinstance(v, str):
@@ -142,6 +139,11 @@ def _iter_events(ws, cfg: Config):
                     start = time(int(m.group(1)), int(m.group(2)))
                     end = time(int(m.group(3)), int(m.group(4)))
                     return (start, end)
+                m2 = SINGLE_TIME_RE.match(v.strip())
+                if m2:
+                    start = time(int(m2.group(1)), int(m2.group(2)))
+                    # No end time known here
+                    return (start, None)  # type: ignore
         return None
 
     # Helper: scan upward in a column to find a date (accept xlsx date/datetime or DD.MM in text)
@@ -195,93 +197,151 @@ def _iter_events(ws, cfg: Config):
         d = (desc or "").lower()
         return any(k in s or k in d for k in SPECIAL_KEYWORDS)
 
-    if time_rows:
-        # Classic layout path
-        for r, (start, end) in time_rows.items():
-            for c in day_cols.keys():
-                val = _cell_value(ws, r, c)
-                # Only textual cells are considered events; skip dates/numbers
-                if not isinstance(val, str):
-                    continue
-                if not val.strip():
-                    continue
-                if not _is_top_left(ws, r, c):
-                    continue
-                dt = _find_date(ws, r, c, cfg)
-                summary, desc = _split_summary_desc(str(val))
-                dtstart = datetime(dt.year, dt.month, dt.day, start.hour, start.minute, tzinfo=tzinfo)
-                dtend = datetime(dt.year, dt.month, dt.day, end.hour, end.minute, tzinfo=tzinfo)
-                uid = f"{cfg.uid_prefix}{dt.isoformat()}-{start.hour:02d}{start.minute:02d}-{uuid.uuid5(uuid.NAMESPACE_DNS, summary)}"
-                event = Event()
-                event.add("summary", summary)
-                if desc:
-                    event.add("description", desc)
-                event.add("dtstart", dtstart)
-                event.add("dtend", dtend)
-                event.add("uid", uid)
-                # Mark special events for clients that support RFC 7986 COLOR
-                if _is_special(summary, desc):
-                    try:
-                        event.add("color", HIGHLIGHT_COLOR)
-                    except Exception:
-                        # Fallback: add as custom property if library rejects COLOR
-                        event.add("X-COLOR", HIGHLIGHT_COLOR)
-                    event.add("categories", "highlight")
-                yield event
-    else:
-        # Alternative layout: times and dates are in the day columns headers
-        # Iterate over grid: for each day column, scan rows beyond headers
-        for c in day_cols.keys():
-            for r in range(1, max_row + 1):
-                val = _cell_value(ws, r, c)
-                # Only textual cells are considered events; skip dates/numbers
-                if not isinstance(val, str):
-                    continue
-                if not val.strip():
-                    continue
-                name = val.strip().lower()
-                # Skip header-like cells: day names or pure time ranges
-                if name in DAYS:
-                    continue
-                m_hdr_time = TIME_RE.search(name)
-                if m_hdr_time and m_hdr_time.group(0).strip() == name:
-                    continue
-                if not _is_top_left(ws, r, c):
-                    continue
+    # Build per-column time mapping from header rows (prefer exact time_row)
+    col_times: dict[int, tuple[time, time] | tuple[time, None]] = {}
+    for c in range(cfg.scan.col_start, cfg.scan.col_end + 1):
+        v = _cell_value(ws, cfg.scan.time_row, c)
+        start_end: tuple[time, time] | tuple[time, None] | None = None
+        if isinstance(v, str):
+            m = TIME_RE.search(v)
+            if m:
+                start_end = (
+                    time(int(m.group(1)), int(m.group(2))),
+                    time(int(m.group(3)), int(m.group(4))),
+                )
+            else:
+                m2 = SINGLE_TIME_RE.match(v.strip())
+                if m2:
+                    start_end = (
+                        time(int(m2.group(1)), int(m2.group(2))),
+                        None,
+                    )
+        # If not found on the preferred row, try within header rows window
+        if not start_end:
+            for r in range(cfg.scan.header_min_row, cfg.scan.header_max_row + 1):
+                v2 = _cell_value(ws, r, c)
+                if isinstance(v2, str):
+                    m = TIME_RE.search(v2)
+                    if m:
+                        start_end = (
+                            time(int(m.group(1)), int(m.group(2))),
+                            time(int(m.group(3)), int(m.group(4))),
+                        )
+                        break
+                    m2 = SINGLE_TIME_RE.match(v2.strip())
+                    if m2:
+                        start_end = (
+                            time(int(m2.group(1)), int(m2.group(2))),
+                            None,
+                        )
+                        break
+        if start_end:
+            col_times[c] = start_end
+
+    # Fill missing end times using default duration only (events have only start)
+    for c in range(cfg.scan.col_start, cfg.scan.col_end + 1):
+        ts = col_times.get(c)
+        if not ts:
+            continue
+        start, end = ts
+        if end is None:
+            # Default duration
+            start_dt = datetime(2000, 1, 1, start.hour, start.minute)
+            end_dt = start_dt + timedelta(minutes=cfg.scan.default_duration_minutes)
+            end = time(end_dt.hour, end_dt.minute)
+        col_times[c] = (start, end)
+
+    # Helper: parse date from a single cell value
+    def _parse_date_val(val) -> date | None:
+        if isinstance(val, datetime):
+            return val.date()
+        if isinstance(val, date):
+            return val
+        if isinstance(val, str):
+            m = DATE_RE.search(val)
+            if m:
+                d, mth = int(m.group(1)), int(m.group(2))
+                return date(cfg.year, mth, d)
+        return None
+
+    # Maintain per-column current date, updated on special date rows (e.g., 5,7,9,...)
+    current_date_for_col: dict[int, date] = {}
+
+    def _update_date_mapping_for_row(r: int):
+        updated = False
+        for c in range(cfg.scan.col_start, cfg.scan.col_end + 1):
+            v = _cell_value(ws, r, c)
+            d = _parse_date_val(v)
+            if d is not None:
+                current_date_for_col[c] = d
+                updated = True
+        return updated
+
+    # Prime mapping with any date rows before the first event row
+    for r0 in range(cfg.scan.header_min_row, min(cfg.scan.first_event_row, max_row + 1)):
+        _update_date_mapping_for_row(r0)
+
+    # Row-wise parsing: iterate rows and columns B..N for event cells
+    for r in range(cfg.scan.first_event_row, max_row + 1):
+        # If this row contains date labels, refresh mapping first
+        _update_date_mapping_for_row(r)
+        for c in range(cfg.scan.col_start, cfg.scan.col_end + 1):
+            val = _cell_value(ws, r, c)
+            if not isinstance(val, str):
+                continue
+            if not val.strip():
+                continue
+            # Skip obvious header-like cells
+            low = val.strip().lower()
+            if low in DAYS:
+                continue
+            if TIME_RE.fullmatch(low) or SINGLE_TIME_RE.fullmatch(low):
+                continue
+            if not _is_top_left(ws, r, c):
+                continue
+
+            # Determine date: prefer per-column mapping from nearest date row (<= r)
+            dt: date | None = current_date_for_col.get(c)
+            if dt is None:
+                # Fallback: scan upward in the same column
                 dt = _scan_date_up(r, c, cfg)
-                tpair = _scan_time_up(r, c)
-                if not tpair:
-                    # Try fallback to time from column A of this row
-                    a_val = _cell_value(ws, r, 1)
-                    if isinstance(a_val, str):
-                        m = TIME_RE.search(a_val)
-                        if m:
-                            tpair = (
-                                time(int(m.group(1)), int(m.group(2))),
-                                time(int(m.group(3)), int(m.group(4))),
-                            )
-                if not tpair:
+
+            # Determine time from column header mapping
+            tpair = col_times.get(c)
+            if not tpair:
+                # As a last resort, scan up for time anywhere in this column
+                tmp = _scan_time_up(r, c)
+                if not tmp or tmp[0] is None:  # type: ignore[index]
                     continue
-                start, end = tpair
-                summary, desc = _split_summary_desc(str(val))
-                dtstart = datetime(dt.year, dt.month, dt.day, start.hour, start.minute, tzinfo=tzinfo)
-                dtend = datetime(dt.year, dt.month, dt.day, end.hour, end.minute, tzinfo=tzinfo)
-                uid = f"{cfg.uid_prefix}{dt.isoformat()}-{start.hour:02d}{start.minute:02d}-{uuid.uuid5(uuid.NAMESPACE_DNS, summary)}"
-                event = Event()
-                event.add("summary", summary)
-                if desc:
-                    event.add("description", desc)
-                event.add("dtstart", dtstart)
-                event.add("dtend", dtend)
-                event.add("uid", uid)
-                # Mark special events
-                if _is_special(summary, desc):
-                    try:
-                        event.add("color", HIGHLIGHT_COLOR)
-                    except Exception:
-                        event.add("X-COLOR", HIGHLIGHT_COLOR)
-                    event.add("categories", "highlight")
-                yield event
+                start, end = tmp  # type: ignore[misc]
+            else:
+                start, end = tpair  # type: ignore[misc]
+
+            # If end time is missing, apply default duration
+            if end is None:
+                start_dt = datetime(2000, 1, 1, start.hour, start.minute)
+                end_dt = start_dt + timedelta(minutes=cfg.scan.default_duration_minutes)
+                end = time(end_dt.hour, end_dt.minute)
+
+            summary, desc = _split_summary_desc(str(val))
+            dtstart = datetime(dt.year, dt.month, dt.day, start.hour, start.minute, tzinfo=tzinfo)
+            dtend = datetime(dt.year, dt.month, dt.day, end.hour, end.minute, tzinfo=tzinfo)
+            uid = f"{cfg.uid_prefix}{dt.isoformat()}-{start.hour:02d}{start.minute:02d}-{uuid.uuid5(uuid.NAMESPACE_DNS, summary)}"
+            event = Event()
+            event.add("summary", summary)
+            if desc:
+                event.add("description", desc)
+            event.add("dtstart", dtstart)
+            event.add("dtend", dtend)
+            event.add("uid", uid)
+            if _is_special(summary, desc):
+                try:
+                    event.add("color", HIGHLIGHT_COLOR)
+                except Exception:
+                    event.add("X-COLOR", HIGHLIGHT_COLOR)
+                event.add("categories", "highlight")
+            yield event
+    # End of row-wise parsing
 
 
 def build_ics(cfg: Config) -> bytes:
